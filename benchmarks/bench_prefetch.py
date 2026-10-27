@@ -13,8 +13,11 @@ import torch
 import torch.distributed as dist
 
 from moonep import Buffer
-from moonep.buffer import create_nvl_dist_tensor, pad_dim0_for_alignment
-from moonep.prefetch import launch_prefetch
+from moonep._backend import (
+    create_nvl_dist_tensor,
+    launch_prefetch,
+    pad_dim0_for_alignment,
+)
 
 
 # Expert shape fixed at 3584x3072 (3583 padded up to a 128 multiple).
@@ -171,8 +174,6 @@ def bench_case(case, args, rank, R):
         assert th % 128 == 0 and thp % 128 == 0, \
             f"{case['label']}: derived extents must be multiples of 128, " \
             f"got ({th}, {thp})"
-        assert pad_dim0_for_alignment([epn, th, thp], _dt) == epn, \
-            f"{case['label']}: fixed-epn VMM chunk must be aligned"
     assert len(counts) == epn, f"{case['label']}: counts must have epn={epn} entries"
     assert all(0 <= c < R for c in counts), f"{case['label']}: each count must be in [0, R)"
 
@@ -186,8 +187,9 @@ def bench_case(case, args, rank, R):
                 321 + rank + tensor_offset + i
             )
             locals_.append(fill_random((epn, th, thp), dt, gen, dev))
-            pool = create_nvl_dist_tensor([epn, th, thp], dt, rank, R)
-            pools.append(pool.view(R, epn, th, thp))
+            padded_epn = pad_dim0_for_alignment([epn, th, thp], dt)
+            pool = create_nvl_dist_tensor([padded_epn, th, thp], dt, rank, R)
+            pools.append(pool.view(R, padded_epn, th, thp)[:, :epn])
         return tuple(locals_), tuple(pools)
 
     local_weights, prefetch_buffers = make_tensors(weight_parts, 0)

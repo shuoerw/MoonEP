@@ -13,8 +13,11 @@ import torch
 import torch.distributed as dist
 
 from moonep import Buffer
-from moonep.buffer import create_nvl_dist_tensor, pad_dim0_for_alignment
-from moonep.grad_reduce import launch_grad_reduce
+from moonep._backend import (
+    create_nvl_dist_tensor,
+    launch_grad_reduce,
+    pad_dim0_for_alignment,
+)
 
 
 # Expert shape fixed at 3584x3072 (3583 padded up to a 128 multiple).
@@ -98,11 +101,9 @@ def bench_case(case, args, rank, R):
         f"{case['label']}: H and Hp must be multiples of 128"
     assert len(counts) == epn, f"{case['label']}: counts must have epn={epn} entries"
     assert all(0 <= c < R for c in counts), f"{case['label']}: each count must be in [0, R)"
-    assert pad_dim0_for_alignment([epn, H, Hp], torch.float32) == epn, \
-        f"{case['label']}: fixed-epn VMM chunk must be aligned"
-
-    reduce_full = create_nvl_dist_tensor([epn, H, Hp], torch.float32, rank, R)
-    reduce_buffers = reduce_full.view(R, epn, H, Hp)
+    padded_epn = pad_dim0_for_alignment([epn, H, Hp], torch.float32)
+    reduce_full = create_nvl_dist_tensor([padded_epn, H, Hp], torch.float32, rank, R)
+    reduce_buffers = reduce_full.view(R, padded_epn, H, Hp)[:, :epn]
     experts_to_copy = expert_plan(R, epn, counts, dev)
 
     # grad_reduce needs the cross-rank barrier slots from Buffer.

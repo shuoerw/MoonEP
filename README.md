@@ -34,7 +34,7 @@ where $T_e$ is the number of tokens routed to expert $e$, and $\bar{T}$ is the e
 ## Supported Devices
 
 - NVIDIA GPU
-- Zhenwu PPU (under review, coming soon)
+- Zhenwu PPU (TileLang backend)
 
 ## Usage
 
@@ -194,6 +194,64 @@ torchrun --nproc_per_node=8 -m pytest tests/test_e2e.py
 torchrun --nproc_per_node=8 -m pytest tests/test_grad_reduce.py
 torchrun --nproc_per_node=8 -m pytest tests/test_prefetch.py
 ```
+
+## PPU backend
+
+The PPU backend requires the PPU SDK, a compatible PPU PyTorch distribution,
+and [T-HEAD TileLang's `dev` branch](https://github.com/t-head/tilelang-for-sail/tree/dev).
+Follow that compiler's build instructions before installing MoonEP; a
+CUDA-only TileLang build cannot compile this backend. The validated compiler
+revision is [`6451a37979f9f1631c61b8198d6eba678260e798`](https://github.com/t-head/tilelang-for-sail/commit/6451a37979f9f1631c61b8198d6eba678260e798)
+(TileLang 0.1.15), including the PPU grid-sync release/acquire fix and the
+`tilelang.ppu.language` interface used by this backend. Use this revision;
+validate newer revisions before deployment rather than relying on the moving
+`dev` branch. MoonEP passes `--dopt=3` explicitly through TileLang's
+`compile_flags`; it does not require a modified compiler optimization default.
+Record the SDK and compiler revisions with test results.
+
+With the SDK environment initialized, install through the same package build
+entry point, explicitly selecting PPU:
+
+```bash
+# Override PPU_SDK if the SDK is installed elsewhere.
+export PPU_SDK=/usr/local/PPU_SDK
+MOONEP_BUILD_TARGET=ppu python -m pip install --no-build-isolation -e .
+```
+
+The default build remains NVIDIA/CuTeDSL. Both builds expose `Buffer` and
+`MoonEPCommPlan` from `moonep`; the PPU wheel selects its implementation
+without importing the CuTeDSL kernels. The PPU kernels compile with
+`target="ppu"` and use LD/ST expert-weight prefetch, without a DMA queue runtime.
+Token hidden size `H` must be a positive even integer: token transfers operate
+on bf16 pairs. Prefetch supports positive expert-row sizes divisible by four
+bytes, including linear uint8 scale rows and partial bulk stripes.
+
+Run the existing correctness commands above on PPU workers. Single-node
+operation supports POSIX file-descriptor sharing; multi-node operation
+requires fabric memory handles. Existing `bench_comm`, `bench_prefetch`,
+and `bench_grad_reduce` support this backend; `bench_vs_deepep` remains
+NVIDIA-only.
+
+### Communication-buffer synchronization
+
+Planning and gradient reduction use `T.sync_grid()`. The PPU compiler marks
+these kernels for cooperative launch, and its runtime uses
+`hgLaunchCooperativeKernel`; this is required for their resident-grid barriers.
+Planning replicates token counts and computes the deterministic allocation on
+each rank, avoiding concentrated reads of rank 0's plan on fabrics without
+hardware multicast. This trades additional count replication for local plan
+reads; sorting still handles only each rank's own routes.
+
+On the current stream, dispatch's exit barrier publishes peer writes before
+its epilogue expands local duplicate rows. Combine publishes staged inputs
+and prologue results at entry before reading peer shards. Completion on one
+rank does not imply that other ranks have finished reading that rank's shard.
+
+The default `inter_rank_sync=True` protects reuse through subsequent Buffer
+calls. Callers that directly overwrite communication-buffer views outside
+those calls must first ensure peer readers have completed. For asynchronous
+calls, also honor the returned event on the consuming stream. Tests must use
+these same ordering rules, not add barriers between normal pipeline stages.
 
 ## Acknowledgments
 

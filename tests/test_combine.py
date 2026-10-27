@@ -6,6 +6,7 @@ Run with:
 
 import pytest
 import torch
+from moonep._backend import IS_PPU
 
 from tests.kernel_test_utils import (
     KernelCase,
@@ -54,6 +55,16 @@ COMBINE_CASES = [
     ),
 ]
 
+if IS_PPU:
+    COMBINE_CASES.extend(
+        KernelCase(
+            f"partial_hidden_{hidden}", S=9, K=4, epn=5, H=hidden,
+            num_sms=8, token_padding=1, routing="duplicate_topk", min_R=2,
+        )
+        for hidden in (2, 16, 66, 258, 2880)
+    )
+
+
 GLOBAL_REF_CASES = [
     KernelCase("global_balanced", S=64, K=4, epn=8, H=128, num_sms=8),
     KernelCase(
@@ -90,9 +101,12 @@ def _random_inputs(case, rank, R, seed=0):
 
 
 def _dispatch_inputs(ctx, case, rank, R, seed=0):
-    from moonep.dispatch import launch_dispatch
-    from moonep.dispatch_epilogue import launch_dispatch_epilogue
-    from moonep.planning import allocate_planning_outputs, launch_planning
+    from moonep._backend import (
+        allocate_planning_outputs,
+        launch_dispatch,
+        launch_dispatch_epilogue,
+        launch_planning,
+    )
 
     hidden, weights, topk, tpe = _random_inputs(case, rank, R, seed)
     plan, cu_seqlens = allocate_planning_outputs(ctx)
@@ -114,9 +128,11 @@ def _dispatch_inputs(ctx, case, rank, R, seed=0):
 
 
 def _combine_full(ctx, case, plan, hidden_user, weights_user=None):
-    from moonep.combine import launch_combine
-    from moonep.combine_prologue import launch_combine_prologue
-    from moonep.inter_rank_sync import launch_inter_rank_sync
+    from moonep._backend import (
+        launch_combine,
+        launch_combine_prologue,
+        launch_inter_rank_sync,
+    )
 
     output = torch.empty(
         case.S, case.H, dtype=torch.bfloat16, device=hidden_user.device
@@ -277,6 +293,8 @@ def test_combine_output_sk_gathers_route_weights(dist_env):
 
 
 def test_buffer_combine_stages_external_buffers_and_gathers_weights(dist_env):
+    from moonep._backend import launch_inter_rank_sync
+
     rank, R = dist_env
     case = KernelCase("public_staging", S=128, K=4, epn=8, H=128, num_sms=8)
     ctx = init_case(case, R)
@@ -289,6 +307,10 @@ def test_buffer_combine_stages_external_buffers_and_gathers_weights(dist_env):
 
     staged_hidden = hidden_user.clone()
     staged_weights = weights_user.clone()
+    # This test deliberately overwrites the mapped shard outside Buffer.
+    # Both backends need peer readers to finish before poisoning their source.
+    # Normal Buffer calls protect reuse with the next entry synchronization.
+    launch_inter_rank_sync(ctx)
     ctx["hidden_buf_local"].zero_()
     ctx["weights_buf_local"].zero_()
 
@@ -348,7 +370,7 @@ def test_combine_large_hidden_stride_identity(dist_env, case):
 
 
 def test_combine_rejects_bad_inputs(dist_env):
-    from moonep.combine import launch_combine
+    from moonep._backend import launch_combine
 
     rank, R = dist_env
     case = KernelCase("bad_inputs", S=4, K=2, epn=2, H=128, num_sms=1)

@@ -22,6 +22,7 @@ from tests.kernel_test_utils import (
     make_topk,
 )
 from tests.planning_reference import launch_planning_torch_reference
+from moonep._backend import IS_PPU
 
 
 DISPATCH_CASES = [
@@ -91,6 +92,16 @@ DISPATCH_CASES = [
     ),
 ]
 
+if IS_PPU:
+    DISPATCH_CASES.extend(
+        KernelCase(
+            f"partial_hidden_{hidden}", S=9, K=4, epn=5, H=hidden,
+            num_sms=8, token_padding=1, routing="duplicate_topk", min_R=2,
+        )
+        for hidden in (2, 16, 66, 258, 2880)
+    )
+
+
 ZERO_FILL_CASES = [
     KernelCase(
         "local_padding",
@@ -157,9 +168,12 @@ def _plan_and_dispatch(
     hidden_user=None,
     weights_user=None,
 ):
-    from moonep.dispatch import launch_dispatch
-    from moonep.dispatch_epilogue import launch_dispatch_epilogue
-    from moonep.planning import allocate_planning_outputs, launch_planning
+    from moonep._backend import (
+        allocate_planning_outputs,
+        launch_dispatch,
+        launch_dispatch_epilogue,
+        launch_planning,
+    )
 
     topk, tpe = make_topk(case, rank, R)
     plan, _cu = allocate_planning_outputs(ctx)
@@ -349,9 +363,12 @@ def test_dispatch_dedup_plan_clears_padding_with_weights(dist_env, case):
 
 
 def test_dispatch_saved_plan_hidden_only_reuses_dst_and_skips_weights(dist_env):
-    from moonep.dispatch import launch_dispatch
-    from moonep.dispatch_epilogue import launch_dispatch_epilogue
-    from moonep.planning import allocate_planning_outputs, launch_planning
+    from moonep._backend import (
+        allocate_planning_outputs,
+        launch_dispatch,
+        launch_dispatch_epilogue,
+        launch_planning,
+    )
 
     rank, R = dist_env
     case = KernelCase(
@@ -442,9 +459,12 @@ def test_dispatch_large_hidden_stride_spotcheck(dist_env, case):
 
 
 def test_dispatch_rejects_bad_inputs(dist_env):
-    from moonep.dispatch import launch_dispatch
-    from moonep.dispatch_epilogue import launch_dispatch_epilogue
-    from moonep.planning import allocate_planning_outputs, launch_planning
+    from moonep._backend import (
+        allocate_planning_outputs,
+        launch_dispatch,
+        launch_dispatch_epilogue,
+        launch_planning,
+    )
 
     rank, R = dist_env
     case = KernelCase("bad_inputs", S=4, K=2, epn=2, H=8, num_sms=1, token_padding=1)

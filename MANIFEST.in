@@ -1,0 +1,2 @@
+include setup_ppu.py
+recursive-include csrc *.cu *.cpp *.cuh *.hpp

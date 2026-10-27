@@ -14,6 +14,15 @@ The .so lands at `moonep/_C.<abi-tag>.so`.
 
 import os
 
+if os.environ.get("MOONEP_BUILD_TARGET", "cuda").strip().lower() == "ppu":
+    import runpy
+
+    runpy.run_path(
+        os.path.join(os.path.dirname(__file__), "setup_ppu.py"),
+        run_name="__main__",
+    )
+    raise SystemExit
+
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 

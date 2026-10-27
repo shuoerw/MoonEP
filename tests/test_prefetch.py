@@ -17,15 +17,17 @@ Coverage axes:
   - lifecycle: collective completion and repeated launches on one Buffer.
 """
 
-import os
-
 import pytest
 import torch
 import torch.distributed as dist
 
 from moonep import Buffer
-from moonep.buffer import create_nvl_dist_tensor, pad_to_granularity
-from moonep.prefetch import launch_prefetch
+from moonep._backend import (
+    IS_PPU,
+    create_nvl_dist_tensor,
+    launch_prefetch,
+    pad_to_granularity,
+)
 from tests.kernel_test_utils import local_device_index
 
 
@@ -124,7 +126,7 @@ CASES = [
     {
         "name": "mxfp4_packed_k3_gate_up",
         "epn": 8,
-        "H": 2 * K3_I, 
+        "H": 2 * K3_I,
         "Hp": K3_H // 2,
         "num_sms": 32,
         "owner_offset": 1,
@@ -134,8 +136,8 @@ CASES = [
     {
         "name": "mxfp4_packed_k3_down",
         "epn": 8,
-        "H": K3_H, 
-        "Hp": K3_I // 2, 
+        "H": K3_H,
+        "Hp": K3_I // 2,
         "num_sms": 32,
         "owner_offset": 2,
         "pattern": "multiple_owners",
@@ -267,26 +269,12 @@ CASES = [
 
 
 @pytest.fixture(scope="module")
-def dist_env():
-    if "RANK" not in os.environ:
-        pytest.skip("test_prefetch requires torchrun with at least 2 GPUs")
-
-    owns_process_group = not dist.is_initialized()
-    if owns_process_group:
-        dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    torch.cuda.set_device(local_device_index())
-    R = dist.get_world_size()
-    if R < 2:
-        if owns_process_group:
-            dist.destroy_process_group()
+def dist_env(dist_env):
+    # Share the session-owned group across test modules; recreating NCCL
+    # groups with the same rendezvous can race teardown on peer ranks.
+    if dist_env[1] < 2:
         pytest.skip("test_prefetch requires at least 2 GPUs")
-
-    yield rank, R
-
-    dist.barrier(device_ids=[local_device_index()])
-    if owns_process_group:
-        dist.destroy_process_group()
+    return dist_env
 
 
 def _fill_random(shape, dtype, gen):
@@ -497,6 +485,22 @@ def run_case(rank, R, case):
         )
 
     dist.barrier(device_ids=[local_device_index()])
+
+
+if IS_PPU:
+    # Linear uint8 scales need not be retiled to a 128x128 matrix on PPU.
+    # Cover all bulk tails, scalar tails, row strides and storage offsets.
+    CASES.extend(
+        dict(
+            name=f"linear_scale_tail_{row_bytes}_offset_{offset}",
+            epn=4, H=128, Hp=128, num_sms=8, owner_offset=1,
+            pattern="self_remote", scales=True, scale_dtype=torch.uint8,
+            scale_shape=(1, row_bytes), offset_bytes=offset, repeats=2,
+            experts=lambda epn: [0, epn - 1, 1, -1],
+        )
+        for row_bytes in (4, 128, 256, 384, 516, 640, 768, 896)
+        for offset in (0, 4, 16)
+    )
 
 
 @pytest.mark.parametrize("case", CASES, ids=[case["name"] for case in CASES])

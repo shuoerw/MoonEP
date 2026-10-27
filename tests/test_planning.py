@@ -244,7 +244,7 @@ def test_planning_step1_case_coverage():
 
 @pytest.mark.parametrize("case", case_params(PLANNING_CASES))
 def test_planning_matches_reference_and_invariants(dist_env, case):
-    from moonep.planning import allocate_planning_outputs, launch_planning
+    from moonep._backend import allocate_planning_outputs, launch_planning
 
     rank, R = dist_env
     skip_if_unsupported_world_size(case, R)

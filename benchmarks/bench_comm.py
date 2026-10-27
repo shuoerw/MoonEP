@@ -77,14 +77,18 @@ import torch.distributed as dist
 from tests.generate_topk_routing import generate_topk_routing
 
 from moonep import Buffer
-from moonep.buffer import create_nvl_dist_tensor, pad_dim0_for_alignment
-from moonep.dispatch import launch_dispatch
-from moonep.dispatch_epilogue import launch_dispatch_epilogue
-from moonep.combine import launch_combine
-from moonep.combine_prologue import launch_combine_prologue
-from moonep.grad_reduce import launch_grad_reduce
-from moonep.planning import allocate_planning_outputs, launch_planning
-from moonep.prefetch import launch_prefetch
+from moonep._backend import (
+    allocate_planning_outputs,
+    create_nvl_dist_tensor,
+    launch_combine,
+    launch_combine_prologue,
+    launch_dispatch,
+    launch_dispatch_epilogue,
+    launch_grad_reduce,
+    launch_planning,
+    launch_prefetch,
+    pad_dim0_for_alignment,
+)
 
 
 def fmt4(x: float) -> str:
@@ -313,26 +317,27 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     else:
         max_send = 0
 
-    assert pad_dim0_for_alignment([epn, H, Hp], torch.bfloat16) == epn
+    weight_epn_padded = pad_dim0_for_alignment([epn, H, Hp], torch.bfloat16)
     weights_local = tuple(
         torch.randn(epn, H, Hp, dtype=torch.bfloat16, device=dev)
         for _ in range(3)
     )
     prefetch_full = tuple(
         create_nvl_dist_tensor(
-            [epn, H, Hp], torch.bfloat16, group_rank, R, group=group,
+            [weight_epn_padded, H, Hp], torch.bfloat16, group_rank, R, group=group,
         )
         for _ in range(3)
     )
     prefetch_buffers = tuple(
-        tensor.view(R, epn, H, Hp) for tensor in prefetch_full
+        tensor.view(R, weight_epn_padded, H, Hp)[:, :epn]
+        for tensor in prefetch_full
     )
 
-    assert pad_dim0_for_alignment([epn, H, Hp], torch.float32) == epn
+    grad_epn_padded = pad_dim0_for_alignment([epn, H, Hp], torch.float32)
     grads_local = torch.zeros(epn, H, Hp, dtype=torch.float32, device=dev)
     reduce_full = create_nvl_dist_tensor(
-        [epn, H, Hp], torch.float32, group_rank, R, group=group)
-    reduce_buffers = reduce_full.view(R, epn, H, Hp)
+        [grad_epn_padded, H, Hp], torch.float32, group_rank, R, group=group)
+    reduce_buffers = reduce_full.view(R, grad_epn_padded, H, Hp)[:, :epn]
     local_reduce_slots = torch.randn_like(reduce_buffers[group_rank])
     reduce_buffers[group_rank].copy_(local_reduce_slots)
     torch.cuda.synchronize()

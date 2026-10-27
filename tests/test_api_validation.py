@@ -2,7 +2,22 @@ from types import SimpleNamespace
 
 import pytest
 
-from moonep import api
+from moonep._backend import IS_PPU, api
+
+
+@pytest.mark.skipif(not IS_PPU, reason="PPU bf16-pair copy validation")
+@pytest.mark.parametrize("hidden", [0, -2, 1, 3, True, 2.0])
+def test_create_context_rejects_invalid_hidden(monkeypatch, hidden):
+    monkeypatch.setattr(api.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        api.torch.cuda, "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=39),
+    )
+    monkeypatch.setattr(api.dist, "get_rank", lambda **_: 0)
+    monkeypatch.setattr(api.dist, "get_world_size", lambda **_: 1)
+    error = TypeError if isinstance(hidden, (bool, float)) else ValueError
+    with pytest.raises(error, match="H must be a positive even int"):
+        api._create_context(1, hidden, 1, 1, 1)
 
 
 @pytest.mark.parametrize(

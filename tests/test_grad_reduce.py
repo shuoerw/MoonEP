@@ -19,15 +19,16 @@ Coverage axes:
     and the cooperative grid counter must self-reset between launches).
 """
 
-import os
-
 import pytest
 import torch
 import torch.distributed as dist
 
 from moonep import Buffer
-from moonep.buffer import create_nvl_dist_tensor, pad_to_granularity
-from moonep.grad_reduce import launch_grad_reduce
+from moonep._backend import (
+    create_nvl_dist_tensor,
+    launch_grad_reduce,
+    pad_to_granularity,
+)
 from tests.kernel_test_utils import local_device_index
 
 
@@ -404,26 +405,12 @@ CASES = [
 
 
 @pytest.fixture(scope="module")
-def dist_env():
-    if "RANK" not in os.environ:
-        pytest.skip("test_grad_reduce requires torchrun with at least 2 GPUs")
-
-    owns_process_group = not dist.is_initialized()
-    if owns_process_group:
-        dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    torch.cuda.set_device(local_device_index())
-    R = dist.get_world_size()
-    if R < 2:
-        if owns_process_group:
-            dist.destroy_process_group()
+def dist_env(dist_env):
+    # Share the session-owned group across test modules; recreating NCCL
+    # groups with the same rendezvous can race teardown on peer ranks.
+    if dist_env[1] < 2:
         pytest.skip("test_grad_reduce requires at least 2 GPUs")
-
-    yield rank, R
-
-    dist.barrier(device_ids=[local_device_index()])
-    if owns_process_group:
-        dist.destroy_process_group()
+    return dist_env
 
 
 def _make_reduce_pool(rank, R, epn, H, Hp, extra_rank_pages=0, offset_bytes=0):
@@ -451,6 +438,8 @@ def _verify_padding(rank, pool, backing, label):
 def run_case(rank, R, case):
     dev = "cuda"
     epn = case["epn"]
+    if case.get("plan") == "fan_in":
+        epn = max(epn, 2 * R)
     E = R * epn
     H = case["H"]
     Hp = case["Hp"]

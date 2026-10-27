@@ -11,8 +11,8 @@ Run with:
 import torch
 import torch.distributed as dist
 
-from moonep.buffer import create_nvl_dist_tensor, pad_dim0_for_alignment
 from moonep import Buffer, MoonEPCommPlan
+from moonep._backend import create_nvl_dist_tensor, pad_dim0_for_alignment
 from tests.kernel_test_utils import (
     clone_dedup_plan_fields,
     local_device_index,
@@ -21,11 +21,13 @@ from tests.kernel_test_utils import (
 )
 
 
-def setup():
-    dist.init_process_group(backend="nccl")
+def setup_distributed():
+    owns_process_group = not dist.is_initialized()
+    if owns_process_group:
+        dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     torch.cuda.set_device(local_device_index())
-    return rank, dist.get_world_size()
+    return rank, dist.get_world_size(), owns_process_group
 
 
 def make_inputs(rank, S, H, K, E, seed=0):
@@ -49,12 +51,9 @@ def weight_base(experts, H, Hp, offset, dev):
 
 def make_dist_pool(rank, R, epn, H, Hp, dtype):
     padded_epn = pad_dim0_for_alignment([epn, H, Hp], dtype)
-    assert padded_epn == epn, (
-        f"public pool chunk [epn={epn}, H={H}, H'={Hp}] must be VMM aligned"
-    )
-    return create_nvl_dist_tensor([epn, H, Hp], dtype, rank, R).view(
-        R, epn, H, Hp
-    )
+    return create_nvl_dist_tensor([padded_epn, H, Hp], dtype, rank, R).view(
+        R, padded_epn, H, Hp
+    )[:, :epn]
 
 
 def make_prefetch_args(rank, R, epn, H, Hp):
@@ -193,8 +192,8 @@ def assert_raises_assertion(expected_substr, fn):
 
 
 def test_e2e():
-    rank, R = setup()
-    # epn=8 keeps both bf16 weight and fp32 grad chunks VMM-granularity aligned.
+    rank, R, owns_process_group = setup_distributed()
+    # Pool allocation pads each rank's chunk to the backend VMM granularity.
     S, H, K, E = 256, 1024, 4, R * 8
     epn = E // R
     Hp = 128
@@ -394,7 +393,8 @@ def test_e2e():
         print("[test_e2e] PASS: public API sync/async, separate prefetch, and plan reuse match.")
 
     buffer.destroy()
-    dist.destroy_process_group()
+    if owns_process_group:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
