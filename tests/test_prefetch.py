@@ -17,15 +17,17 @@ Coverage axes:
   - lifecycle: collective completion and repeated launches on one Buffer.
 """
 
-import os
-
 import pytest
 import torch
 import torch.distributed as dist
 
 from moonep import Buffer
-from moonep.buffer import create_nvl_dist_tensor, pad_to_granularity
-from moonep.prefetch import launch_prefetch
+from moonep.api import (
+    IS_PPU,
+    create_nvl_dist_tensor,
+    launch_prefetch,
+    pad_to_granularity,
+)
 from tests.kernel_test_utils import local_device_index
 
 
@@ -124,7 +126,7 @@ CASES = [
     {
         "name": "mxfp4_packed_k3_gate_up",
         "epn": 8,
-        "H": 2 * K3_I, 
+        "H": 2 * K3_I,
         "Hp": K3_H // 2,
         "num_sms": 32,
         "owner_offset": 1,
@@ -134,8 +136,8 @@ CASES = [
     {
         "name": "mxfp4_packed_k3_down",
         "epn": 8,
-        "H": K3_H, 
-        "Hp": K3_I // 2, 
+        "H": K3_H,
+        "Hp": K3_I // 2,
         "num_sms": 32,
         "owner_offset": 2,
         "pattern": "multiple_owners",
@@ -267,26 +269,12 @@ CASES = [
 
 
 @pytest.fixture(scope="module")
-def dist_env():
-    if "RANK" not in os.environ:
-        pytest.skip("test_prefetch requires torchrun with at least 2 GPUs")
-
-    owns_process_group = not dist.is_initialized()
-    if owns_process_group:
-        dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    torch.cuda.set_device(local_device_index())
-    R = dist.get_world_size()
-    if R < 2:
-        if owns_process_group:
-            dist.destroy_process_group()
+def dist_env(dist_env):
+    # Share the session-owned group across test modules; recreating NCCL
+    # groups with the same rendezvous can race teardown on peer ranks.
+    if dist_env[1] < 2:
         pytest.skip("test_prefetch requires at least 2 GPUs")
-
-    yield rank, R
-
-    dist.barrier(device_ids=[local_device_index()])
-    if owns_process_group:
-        dist.destroy_process_group()
+    return dist_env
 
 
 def _fill_random(shape, dtype, gen):
@@ -499,12 +487,74 @@ def run_case(rank, R, case):
     dist.barrier(device_ids=[local_device_index()])
 
 
+if IS_PPU:
+    # Linear uint8 scales need not be retiled to a 128x128 matrix on PPU.
+    # Cover all bulk tails, scalar tails, row strides and storage offsets.
+    CASES.extend(
+        dict(
+            name=f"linear_scale_tail_{row_bytes}_offset_{offset}",
+            epn=4, H=128, Hp=128, num_sms=8, owner_offset=1,
+            pattern="self_remote", scales=True, scale_dtype=torch.uint8,
+            scale_shape=(1, row_bytes), offset_bytes=offset, repeats=2,
+            experts=lambda epn: [0, epn - 1, 1, -1],
+        )
+        for row_bytes in (4, 128, 256, 384, 516, 640, 768, 896)
+        for offset in (0, 4, 16)
+    )
+
+
 @pytest.mark.parametrize("case", CASES, ids=[case["name"] for case in CASES])
 def test_prefetch_case(dist_env, case):
     rank, R = dist_env
     if rank == 0:
         print(f"[test_prefetch] Running case={case['name']} with R={R}")
     run_case(rank, R, case)
+
+
+@pytest.mark.skipif(not IS_PPU, reason="PPU bulk helper interoperability")
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("ref_first", [False, True])
+def test_mixed_bulk_reference_and_offset_helpers(dist_env, remote, ref_first):
+    import tilelang
+    import tilelang.ppu.language as T
+    from moonep.tilelang.primitives import (
+        fast_bulk_load_128, fast_bulk_load_128_ref,
+        fast_bulk_store_128, fast_bulk_store_128_ref,
+    )
+
+    rank, world_size = dist_env
+    stride = pad_to_granularity(64 * 4) // 4
+    pool = create_nvl_dist_tensor([stride], torch.int32, rank, world_size)
+    values = torch.arange(64, dtype=torch.int32, device="cuda")
+    pool[rank * stride:rank * stride + 64].copy_(values + rank * 100)
+    output = torch.empty_like(values)
+    owner = (rank + 1) % world_size if remote else rank
+
+    @T.prim_func
+    def kernel(source_ptr: T.handle, output_ptr: T.handle, begin: T.int32):
+        source = T.match_buffer(source_ptr, (world_size * stride,), T.int32)
+        result = T.match_buffer(output_ptr, (64,), T.int32)
+        with T.Kernel(1, threads=32):
+            if ref_first:
+                first = fast_bulk_load_128_ref(source[begin], T.bool(remote))
+                fast_bulk_store_128_ref(result[0], first, T.bool(False))
+                second = fast_bulk_load_128(source[begin], T.int64(128), T.bool(remote))
+                fast_bulk_store_128(result[0], T.int64(128), second, T.bool(False))
+            else:
+                first = fast_bulk_load_128(source[begin], T.int64(0), T.bool(remote))
+                fast_bulk_store_128(result[0], T.int64(0), first, T.bool(False))
+                second = fast_bulk_load_128_ref(source[begin + 32], T.bool(remote))
+                fast_bulk_store_128_ref(result[32], second, T.bool(False))
+
+    compiled = tilelang.compile(
+        kernel, target="ppu", compile_flags=["--dopt=3"], execution_backend="tvm_ffi"
+    )
+    torch.cuda.synchronize()
+    dist.barrier()
+    compiled(pool, output, owner * stride)
+    torch.cuda.synchronize()
+    dist.barrier()
+    assert torch.equal(output, values + owner * 100)
 
 
 if __name__ == "__main__":
