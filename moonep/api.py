@@ -57,22 +57,45 @@ import warnings
 import torch
 import torch.distributed as dist
 
-from .buffer import (
-    create_nvl_dist_tensor,
-    create_nvl_dist_multicast_tensor,
-    pad_dim0_for_alignment,
-    get_vmm_granularity,
-    get_multicast_granularity,
-)
+from . import _C
 from .constants import DEDUP_BUILDER_WARPS
-from .planning import MoonEPCommPlan, allocate_planning_outputs, launch_planning
-from .inter_rank_sync import launch_inter_rank_sync
-from .dispatch import launch_dispatch
-from .dispatch_epilogue import launch_dispatch_epilogue
-from .combine import launch_combine
-from .combine_prologue import launch_combine_prologue
-from .prefetch import _ELEM_TYPES, launch_prefetch
-from .grad_reduce import launch_grad_reduce
+
+IS_PPU = bool(getattr(_C, "TILELANG_PPU_BUILD", False))
+
+if IS_PPU:
+    from .tilelang import memory as _ppu_memory
+    from .tilelang.memory import (
+        create_icn_dist_tensor as create_nvl_dist_tensor,
+        pad_dim0_for_alignment,
+        pad_to_granularity,
+    )
+    from .tilelang.planning import MoonEPCommPlan, allocate_planning_outputs, launch_planning
+    from .tilelang.sync import launch_inter_rank_sync
+    from .tilelang.dispatch import launch_dispatch
+    from .tilelang.dispatch_epilogue import launch_dispatch_epilogue
+    from .tilelang.combine import launch_combine
+    from .tilelang.combine_prologue import launch_combine_prologue
+    from .tilelang.prefetch import launch_prefetch
+    from .tilelang.grad_reduce import launch_grad_reduce
+
+    _ELEM_TYPES = frozenset((torch.bfloat16, torch.int8, torch.uint8))
+else:
+    from .buffer import (
+        create_nvl_dist_tensor,
+        create_nvl_dist_multicast_tensor,
+        pad_dim0_for_alignment,
+        pad_to_granularity,
+        get_vmm_granularity,
+        get_multicast_granularity,
+    )
+    from .planning import MoonEPCommPlan, allocate_planning_outputs, launch_planning
+    from .inter_rank_sync import launch_inter_rank_sync
+    from .dispatch import launch_dispatch
+    from .dispatch_epilogue import launch_dispatch_epilogue
+    from .combine import launch_combine
+    from .combine_prologue import launch_combine_prologue
+    from .prefetch import _ELEM_TYPES, launch_prefetch
+    from .grad_reduce import launch_grad_reduce
 
 logger = logging.getLogger(__name__)
 
@@ -137,10 +160,12 @@ def _log_context_buffer_size(ctx: dict) -> None:
         return
 
     R = int(ctx['R'])
-    hidden_mapped_bytes = tensor_nbytes(ctx['hidden_buf'])
-    meta_mapped_bytes = tensor_nbytes(ctx['meta_buf'])
-    hidden_chunk_bytes = hidden_mapped_bytes // R
-    meta_chunk_bytes = meta_mapped_bytes // R
+    if IS_PPU:
+        hidden_chunk_bytes = _ppu_memory.physical_nbytes(ctx['hidden_buf'], R)
+        meta_chunk_bytes = _ppu_memory.physical_nbytes(ctx['meta_buf'], R)
+    else:
+        hidden_chunk_bytes = tensor_nbytes(ctx['hidden_buf']) // R
+        meta_chunk_bytes = tensor_nbytes(ctx['meta_buf']) // R
     local_temp_bytes = sum(
         tensor_nbytes(ctx[name])
         for name in (
@@ -156,6 +181,8 @@ def _log_context_buffer_size(ctx: dict) -> None:
         )
     )
 
+    if 'weight_slot_route' in ctx:
+        local_temp_bytes += tensor_nbytes(ctx['weight_slot_route'])
     total_buffer_bytes = hidden_chunk_bytes + meta_chunk_bytes + local_temp_bytes
 
     log_lines = [
@@ -207,21 +234,21 @@ def _create_context(
     token_padding: int = 128,
     group: "dist.ProcessGroup | None" = None,
 ) -> dict:
-    """Pre-allocate all NVLink shared buffers and local temp buffers.
+    """Pre-allocate rank-mapped communication buffers and local temp buffers.
 
     The extra logical NvS slots from token_padding are bounded by
     (token_padding - 1) * 2 * E / num_ep_ranks. The logical capacity is then
     rounded up to token_padding, while the physical allocation is separately
     aligned to VMM granularity.
-    NVLink shared buffer layout:
+    Communication buffer layout:
       - hidden_buf: [NvS_padded, H] bf16 — separate allocation, padded for VMM alignment
       - meta_buf:   [meta_chunk_padded] int32 — merged allocation containing:
           [0, NvS):                weights (fp32, alias as int32)
-          [NvS, NvS + R*E):       tpe gather (only rank 0 is the read/write target; symmetric reserve)
+          [NvS, NvS + R*E):       TPE gather (replicated per rank on PPU)
           [NvS + R*E, ...):       planning internal scratch/staging
-          [..., +N4):             topk0 offload scratch
-          [..., +N4):             ORDER, c1 order consumed by c2/passB
-          [..., +N4):             ORDER0, rank1 rank0-c1 scratch
+          [..., +N4):             TOPK0, offload scratch; PPU destination hints
+          [..., +N4):             ORDER, stable expert-major route order
+          [..., +N4):             ORDER0, sort scratch; PPU subgroup counters
           [..., +3):              cross-rank phase barrier
           [..., +NvS):            src_info scratch published by planning and
                                   consumed by the fresh dispatch dedup builder;
@@ -253,6 +280,12 @@ def _create_context(
         f"num_ep_ranks ({R}) must equal group world size "
         f"({dist.get_world_size(group=group)})"
     )
+    if IS_PPU:
+        if not isinstance(H, int) or isinstance(H, bool):
+            raise TypeError(f"H must be a positive even int, got {type(H).__name__}")
+        if H <= 0 or H % 2:
+            raise ValueError(f"H must be a positive even int, got {H}")
+        assert 1 <= K <= 32, f"K must be in [1, 32], got {K}"
     N = S * K
     dev = f"cuda:{device}"
     num_sms_dedup = _num_sms_dedup_from_env(max_sms)
@@ -277,6 +310,10 @@ def _create_context(
     # The physical allocation is aligned separately to VMM granularity below.
     token_padding_extra = (token_padding - 1) * 2 * epn
     NvS = _align_up(NvS_capacity + token_padding_extra, token_padding)
+    if IS_PPU:
+        assert NvS < (1 << 24), (
+            f"NvS={NvS} exceeds the 24-bit local-row field used by the duplicate map"
+        )
 
     # ================================================================
     # Planning constexpr computation and int32 range guards
@@ -324,9 +361,12 @@ def _create_context(
     meta_chunk_logical = SRC_INFO_OFF + NvS
 
     # Chunk size must satisfy both VMM mapping and multicast binding.
-    gran = get_vmm_granularity()
-    mc_gran = get_multicast_granularity(R)
-    chunk_align_bytes = max(gran, mc_gran)
+    if IS_PPU:
+        chunk_align_bytes = _ppu_memory.get_comm_alignment(R)
+    else:
+        gran = get_vmm_granularity()
+        mc_gran = get_multicast_granularity(R)
+        chunk_align_bytes = max(gran, mc_gran)
     meta_chunk_bytes = meta_chunk_logical * 4
     meta_chunk_padded = _align_up(meta_chunk_bytes, chunk_align_bytes) // 4
 
@@ -347,15 +387,23 @@ def _create_context(
     )
 
     # ================================================================
-    # Allocate NVLink shared buffers
+    # Allocate backend communication buffers
     # ================================================================
-    hidden_buf = create_nvl_dist_tensor([NvS_padded, H], torch.bfloat16, rank, R, group=group)
-    meta_buf, meta_mc = create_nvl_dist_multicast_tensor(
-        [meta_chunk_padded], torch.int32, rank, R, group=group,
-    )
+    if IS_PPU:
+        hidden_buf = _ppu_memory.create_hidden_buffer(
+            [NvS_padded, H], torch.bfloat16, rank, R, group=group
+        )
+        meta_buf, meta_mc = _ppu_memory.create_meta_buffers(
+            [meta_chunk_padded], torch.int32, rank, R, group=group,
+        )
+    else:
+        hidden_buf = create_nvl_dist_tensor([NvS_padded, H], torch.bfloat16, rank, R, group=group)
+        meta_buf, meta_mc = create_nvl_dist_multicast_tensor(
+            [meta_chunk_padded], torch.int32, rank, R, group=group,
+        )
 
-    # Zero the barrier region on all ranks
-    for r in range(R):
+    # PPU ranks initialize their own shard; CUDA retains symmetric initialization.
+    for r in ((rank,) if IS_PPU else range(R)):
         meta_buf[r * meta_chunk_padded + BARRIER_OFF:
                  r * meta_chunk_padded + BARRIER_OFF + BARRIER_SLOTS].zero_()
     dist.barrier(group=group)
@@ -380,6 +428,14 @@ def _create_context(
     primary_packed = torch.empty(R * S, dtype=torch.int32, device=dev)
     kmask = torch.empty(R * S, dtype=torch.int32, device=dev)
     kidx_to_loff = torch.empty(R * S * K, dtype=torch.int32, device=dev)
+    if IS_PPU:
+        # Invert each destination slot to its owning route, followed by one
+        # owned-slot count per aligned 32-slot window.
+        weight_slot_route = torch.empty(
+            R * NvS + (R * NvS + 31) // 32,
+            dtype=torch.int32,
+            device=dev,
+        )
     builder_bar = torch.zeros(1, dtype=torch.int32, device=dev)
 
     ctx = {
@@ -394,7 +450,7 @@ def _create_context(
         'token_padding': token_padding,
         'device': device,
         'token_padding_extra': token_padding_extra,
-        # NVLink shared
+        # Backend communication buffers
         'hidden_buf': hidden_buf,
         'meta_buf': meta_buf,
         'meta_mc': meta_mc,
@@ -423,6 +479,11 @@ def _create_context(
         'weights_buf_local': meta_buf[rank * meta_chunk_padded + WEIGHTS_OFF:
                                       rank * meta_chunk_padded + WEIGHTS_OFF + NvS],
     }
+    if IS_PPU:
+        ctx['meta_buf_local'] = _ppu_memory.local_flat_region(
+            meta_buf, rank, meta_chunk_padded, 0, meta_chunk_padded
+        )
+        ctx['weight_slot_route'] = weight_slot_route
     _log_context_buffer_size(ctx)
     return ctx
 
@@ -430,7 +491,7 @@ def _create_context(
 class Buffer:
     """MoonEP communication buffer owner.
 
-    A Buffer owns the NVLink/VMM communication buffers, local scratch tensors,
+    A Buffer owns rank-mapped communication buffers, local scratch tensors,
     and the async communication stream used by dispatch/prefetch/combine/reduce. Call
     ``destroy()`` before tearing down the process group.
     """
@@ -469,6 +530,7 @@ class Buffer:
                 default -1 gives it higher priority than the main stream.
             enable_pdl: launch kernels with programmatic dependent launch;
                 False falls back to plain same-stream serial launches.
+                PPU always uses stream-ordered launches and ignores this flag.
             explicitly_destroy: if True, warn (instead of auto-destroying)
                 when the Buffer is garbage-collected without ``destroy()``.
         """
@@ -479,6 +541,8 @@ class Buffer:
         assert isinstance(enable_pdl, bool), (
             f"enable_pdl must be a bool, got {type(enable_pdl).__name__}"
         )
+        if IS_PPU:
+            enable_pdl = False
         self.explicitly_destroy = explicitly_destroy
         self.comm_stream_priority = comm_stream_priority
         self.enable_pdl = enable_pdl
@@ -525,7 +589,7 @@ class Buffer:
         return self._ctx
 
     def destroy(self) -> None:
-        """Synchronize and release all VMM/NVLink resources held by this Buffer.
+        """Synchronize and release this Buffer's communication resources.
 
         Must be called before tearing down the process group. Idempotent.
         """
@@ -545,6 +609,14 @@ class Buffer:
 
         # Drop views before owners. Tensor deleters release VMM mappings and
         # multicast handles once the Python references disappear.
+        if IS_PPU:
+            ctx.pop('hidden_buf_local', None)
+            ctx.pop('meta_buf_local', None)
+            ctx.pop('weights_buf_local', None)
+            hidden_owner = ctx.get('hidden_buf')
+            meta_owner = ctx.get('meta_buf')
+            if hidden_owner is not None and meta_owner is not None:
+                _ppu_memory.release_comm_buffers(hidden_owner, meta_owner, group=group)
         for key in (
             'hidden_buf_local',
             'weights_buf_local',
@@ -559,6 +631,7 @@ class Buffer:
             'primary_packed',
             'kmask',
             'kidx_to_loff',
+            'weight_slot_route',
             'builder_bar',
         ):
             ctx.pop(key, None)
@@ -588,7 +661,10 @@ class Buffer:
     def _record_streams(tensors, stream: torch.cuda.Stream) -> None:
         for t in tensors:
             if t is not None:
-                t.record_stream(stream)
+                if IS_PPU:
+                    _ppu_memory.record_stream(t, stream)
+                else:
+                    t.record_stream(stream)
 
     @staticmethod
     def _plan_runtime_tensors(plan: MoonEPCommPlan):
@@ -636,11 +712,11 @@ class Buffer:
             build_dedup_map=planning_args is not None,
             pdl_trigger=self.enable_pdl,
         )
-        # In-place duplicate expansion on the NVL shard: after this the shard
-        # holds the full user-visible [NvS, H] layout.
+        # In-place duplicate expansion leaves the local mapped shard in
+        # the full user-visible [NvS, H] layout.
         launch_dispatch_epilogue(ctx, plan, pdl_launch=self.enable_pdl)
-        # master-style boundary copies (same stream, plain SM copies), gated
-        # independently per output tensor.
+        # Boundary copies are independently controlled for hidden states and
+        # router weights.
         if not zero_copy:
             hidden_nvsh.copy_(ctx['hidden_buf_local'])
         if route_weights_nvs is not None and not route_weights_zero_copy:
@@ -661,12 +737,12 @@ class Buffer:
         zero_copy: bool,
         router_weights_zero_copy: bool,
     ) -> None:
-        # Pre-staging sync keeps its master-era position; combine's own entry
-        # cross_rank_barrier publishes the staged + accumulated NVL writes.
+        # Synchronize before staging; combine's entry barrier publishes the
+        # staged inputs and prologue writes to peer readers.
         if inter_rank_sync:
             launch_inter_rank_sync(ctx)
-        # master-style boundary copies into the shard (same stream), gated
-        # independently per input tensor.
+        # Boundary copies are independently controlled for hidden states and
+        # router weights.
         if not zero_copy:
             ctx['hidden_buf_local'].copy_(hidden_nvsh)
         if route_weights_nvs is not None and not router_weights_zero_copy:
@@ -741,7 +817,7 @@ class Buffer:
                 order.
             async_finish: run on the comm stream and append a CUDA event to
                 the return value.
-            inter_rank_sync: run a CuTe DSL rank sync before planning
+            inter_rank_sync: run a stream-ordered cross-rank barrier before planning
                 (default True).
             zero_copy: return a view of the communication buffer
                 (``hidden_buf_local``) instead of a fresh tensor. The view
@@ -994,7 +1070,7 @@ class Buffer:
         zero_copy: bool = False,
         router_weights_zero_copy: bool = False,
     ):
-        """combine fwd: gather expert outputs from the NVL buffer and K-sum
+        """combine fwd: gather expert outputs from rank-mapped shards and K-sum
         back to token-major [S, H].
 
         Also serves as dispatch bwd: combining ``grad_hidden_nvsh`` sums each
@@ -1008,7 +1084,7 @@ class Buffer:
                 dispatch-returned weights to also gather them back to
                 token-major.
             async_finish: run on the comm stream and return a CUDA event.
-            inter_rank_sync: run a CuTe DSL rank sync before staging
+            inter_rank_sync: run a stream-ordered cross-rank barrier before staging
                 (default True).
             zero_copy: ``hidden_nvsh`` must be exactly the view returned by a
                 ``zero_copy=True`` dispatch — the caller's FFN writes its
