@@ -34,7 +34,7 @@ where $T_e$ is the number of tokens routed to expert $e$, and $\bar{T}$ is the e
 ## Supported Devices
 
 - NVIDIA GPU
-- Zhenwu PPU (under review, coming soon)
+- Zhenwu PPU (TileLang backend)
 
 ## Usage
 
@@ -194,6 +194,31 @@ torchrun --nproc_per_node=8 -m pytest tests/test_e2e.py
 torchrun --nproc_per_node=8 -m pytest tests/test_grad_reduce.py
 torchrun --nproc_per_node=8 -m pytest tests/test_prefetch.py
 ```
+
+## PPU backend
+
+The PPU backend requires a PPU SDK with ltOki support, compatible PPU PyTorch,
+and [T-HEAD TileLang's `dev` branch](https://github.com/t-head/tilelang-for-sail/tree/dev).
+Follow TileLang's build instructions, then install MoonEP:
+
+```bash
+export PPU_SDK=/usr/local/PPU_SDK
+MOONEP_BUILD_TARGET=ppu python -m pip install --no-build-isolation -e .
+```
+
+The tests above and `bench_comm`, `bench_prefetch`, and `bench_grad_reduce`
+support PPU; `bench_vs_deepep` is NVIDIA-only. Multi-node runs require fabric
+memory handles.
+
+Token hidden size `H` must be positive and even. Expert rows must have a
+positive size divisible by four bytes.
+
+Prefetch uses ltOki DMA. Create the Buffer outside graph capture, and do not
+overlap calls or graph replays that share a Buffer.
+
+For asynchronous calls, wait on the returned event before consuming outputs.
+Before directly overwriting shared-buffer views, ensure all peer readers
+have completed.
 
 ## Acknowledgments
 

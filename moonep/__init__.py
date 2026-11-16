@@ -1,7 +1,7 @@
 from .api import (
     Buffer,
+    MoonEPCommPlan,
 )
-from .planning import MoonEPCommPlan
 
 __all__ = [
     "Buffer",
